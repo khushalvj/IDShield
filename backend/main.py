@@ -172,123 +172,145 @@ def _ocr_pass(image: Image.Image, psm: int) -> dict:
 
 
 def run_ocr(image: Image.Image) -> dict:
-    """Fast OCR for constrained server environments."""
+    """Fast single-pass OCR designed for low-resource deployment."""
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    scale = max(1.5, min(2.0, 1600 / max(gray.shape[1], 1)))
-    up = cv2.resize(
+    width = gray.shape[1]
+    if width > 1400:
+        scale = 1400 / width
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+    elif width < 900:
+        scale = min(1.5, 900 / max(width, 1))
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+
+    data = pytesseract.image_to_data(
+        gray,
+        config="--oem 3 --psm 6",
+        output_type=pytesseract.Output.DICT,
+    )
+
+    line_words = {}
+    confidences = []
+
+    for i, raw_conf in enumerate(data.get("conf", [])):
+        try:
+            conf = float(raw_conf)
+        except (ValueError, TypeError):
+            continue
+
+        word = str(data.get("text", [""])[i]).strip()
+
+        if conf >= 20 and word:
+            key = (
+                data.get("block_num", [0])[i],
+                data.get("par_num", [0])[i],
+                data.get("line_num", [0])[i],
+            )
+            line_words.setdefault(key, []).append(word)
+
+        if conf >= 0:
+            confidences.append(conf)
+
+    lines = [
+        " ".join(words)
+        for words in line_words.values()
+        if words
+    ]
+
+    confidence = (
+        sum(confidences) / len(confidences)
+        if confidences else 0.0
+    )
+
+    return {
+        "text": "\n".join(lines),
+        "confidence": round(confidence, 2),
+        "method": "fast_single_pass_psm_6",
+        "passes": [{
+            "method": "fast_psm_6",
+            "confidence": round(confidence, 2),
+        }],
+    }
+
+def run_mrz_ocr(image: Image.Image) -> dict:
+    """Fast single-pass MRZ OCR for constrained server environments."""
+    rgb = np.array(image.convert("RGB"))
+    height, width = rgb.shape[:2]
+
+    y0 = int(height * 0.62)
+    crop = rgb[y0:height, :]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+
+    if width > 1400:
+        scale = 1400 / width
+    else:
+        scale = 1.5
+
+    gray = cv2.resize(
         gray,
         None,
         fx=scale,
         fy=scale,
         interpolation=cv2.INTER_CUBIC,
     )
-
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    ).apply(up)
-
-    passes = []
-
-    for sample, label, psm in [
-        (up, "full", 6),
-        (clahe, "clahe", 11),
-    ]:
-        config = f"--oem 3 --psm {psm}"
-
-        data = pytesseract.image_to_data(
-            sample,
-            config=config,
-            output_type=pytesseract.Output.DICT,
-        )
-
-        lines = []
-        confidences = []
-
-        for i, raw_conf in enumerate(data.get("conf", [])):
-            try:
-                conf = float(raw_conf)
-            except (ValueError, TypeError):
-                continue
-
-            text = str(data["text"][i]).strip()
-
-            if conf >= 25 and text:
-                lines.append(text)
-
-            if conf >= 0:
-                confidences.append(conf)
-
-        confidence = (
-            sum(confidences) / len(confidences)
-            if confidences else 0.0
-        )
-
-        passes.append({
-            "text": " ".join(lines),
-            "confidence": round(confidence, 2),
-            "method": f"{label}_psm_{psm}",
-        })
-
-    best = max(passes, key=lambda x: x["confidence"])
-
-    return {
-        "text": best["text"],
-        "confidence": best["confidence"],
-        "method": f"fast_{best['method']}",
-        "passes": [
-            {
-                "method": p["method"],
-                "confidence": p["confidence"],
-            }
-            for p in passes
-        ],
-    }
-
-def run_mrz_ocr(image: Image.Image) -> dict:
-    """Focused OCR for the bottom machine-readable zone of a passport."""
-    rgb = np.array(image.convert("RGB"))
-    height, width = rgb.shape[:2]
-    y0 = int(height * 0.62)
-    crop = rgb[y0:height, :]
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-
-    scale = max(2.5, 1800 / max(width, 1))
-    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    variants = [
-        (gray, 6),
-        (cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1], 6),
-        (gray, 7),
-    ]
+    data = pytesseract.image_to_data(
+        gray,
+        config=(
+            "--oem 3 --psm 7 "
+            "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+        ),
+        output_type=pytesseract.Output.DICT,
+    )
 
-    results = []
-    for sample, psm in variants:
-        config = f"--oem 3 --psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
-        text = pytesseract.image_to_string(sample, config=config).strip()
-        data = pytesseract.image_to_data(sample, config=config, output_type=pytesseract.Output.DICT)
-        confs = []
-        for raw in data.get("conf", []):
-            try:
-                value = float(raw)
-                if value >= 0:
-                    confs.append(value)
-            except (ValueError, TypeError):
-                pass
-        results.append({
-            "text": text,
-            "confidence": round(sum(confs) / len(confs), 2) if confs else 0.0,
-            "method": f"mrz_psm_{psm}",
-        })
+    words = []
+    confidences = []
 
-    best = max(results, key=lambda item: item["confidence"])
-    return best
+    for i, raw_conf in enumerate(data.get("conf", [])):
+        try:
+            conf = float(raw_conf)
+        except (ValueError, TypeError):
+            continue
 
+        value = str(data.get("text", [""])[i]).strip()
+
+        if conf >= 15 and value:
+            words.append(value)
+
+        if conf >= 0:
+            confidences.append(conf)
+
+    text_value = " ".join(words)
+
+    confidence = (
+        sum(confidences) / len(confidences)
+        if confidences else 0.0
+    )
+
+    return {
+        "text": text_value,
+        "confidence": round(confidence, 2),
+        "method": "fast_mrz_psm_7",
+    }
 
 # ---------------------------------------------------------
+# TEXT HELPERS# ---------------------------------------------------------
 # TEXT HELPERS
 # ---------------------------------------------------------
 
@@ -677,52 +699,52 @@ def _rotate_image(image: Image.Image, angle: int) -> Image.Image:
 
 
 def auto_orient_document(image: Image.Image) -> tuple[Image.Image, int, str]:
-    """
-    Normalize EXIF orientation and only rotate when OCR/classification gives
-    evidence that another right-angle orientation is a supported ID.
-
-    This avoids Tesseract OSD incorrectly rotating an already-readable
-    document and accidentally turning a valid passport into an unsupported
-    document.
-    """
+    """Use a tiny OCR probe instead of repeatedly running the full OCR ensemble."""
     base = ImageOps.exif_transpose(image).convert("RGB")
 
-    # First, test the supplied orientation. Do not rotate a document that is
-    # already recognized confidently enough as a supported identity document.
-    try:
-        original_ocr = run_ocr(base)
-        original_classification = detect_document_type(original_ocr["text"])
-        if original_classification.get("type") != "unknown":
-            return base, 0, "original_orientation"
-    except Exception:
-        pass
+    def probe(candidate):
+        rgb = np.array(candidate.convert("RGB"))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    # Only search rotations when the original orientation was not recognized.
-    # A rotation wins only when it produces a supported classification.
-    candidates = []
-    for correction in (90, 180, 270):
-        candidate = _rotate_image(base, correction)
+        width = gray.shape[1]
+        if width > 900:
+            scale = 900 / width
+            gray = cv2.resize(
+                gray,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_AREA,
+            )
+
+        probe_text = pytesseract.image_to_string(
+            gray,
+            config="--oem 3 --psm 11",
+        )
+
+        return detect_document_type(probe_text)
+
+    candidates = [
+        (base, 0, "original_orientation"),
+        (_rotate_image(base, 90), 90, "ocr_probe_rotation"),
+        (_rotate_image(base, 270), 270, "ocr_probe_rotation"),
+        (_rotate_image(base, 180), 180, "ocr_probe_rotation"),
+    ]
+
+    best = candidates[0]
+
+    for candidate, angle, method in candidates:
         try:
-            ocr_probe = run_ocr(candidate)
-            classification = detect_document_type(ocr_probe["text"])
-            cls_conf = float(classification.get("confidence", 0) or 0)
-            ocr_conf = float(ocr_probe.get("confidence", 0) or 0)
-            supported = classification.get("type") != "unknown"
-            evidence_count = len(classification.get("evidence", []) or [])
-            score = (10000 if supported else 0) + cls_conf * 100 + evidence_count * 10 + ocr_conf
-            candidates.append((score, correction, candidate, classification))
+            classification = probe(candidate)
+            if classification.get("type") != "unknown":
+                return candidate, angle, method
         except Exception:
             continue
 
-    if candidates:
-        _, correction, oriented, classification = max(candidates, key=lambda item: item[0])
-        if classification.get("type") != "unknown":
-            return oriented, correction, "ocr_classification_rotation"
-
-    return base, 0, "original_orientation"
-
+    return best
 
 # ---------------------------------------------------------
+# MRZ# ---------------------------------------------------------
 # MRZ
 # ---------------------------------------------------------
 
