@@ -172,56 +172,80 @@ def _ocr_pass(image: Image.Image, psm: int) -> dict:
 
 
 def run_ocr(image: Image.Image) -> dict:
-    """Run several OCR views and keep the strongest evidence from each."""
+    """Fast OCR for constrained server environments."""
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    scale = max(2.0, min(3.0, 1800 / max(gray.shape[1], 1)))
-    up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(up)
-    sharp = cv2.addWeighted(clahe, 1.35, cv2.GaussianBlur(clahe, (0, 0), 2), -0.35, 0)
-    binary = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
 
-    samples = [(up, "full"), (clahe, "clahe"), (sharp, "sharp"), (binary, "adaptive")]
-    # Add a bottom-third view because passport MRZ text is dense and small.
-    bottom = up[int(up.shape[0] * 0.60):, :]
-    samples.append((bottom, "bottom"))
+    scale = max(1.5, min(2.0, 1600 / max(gray.shape[1], 1)))
+    up = cv2.resize(
+        gray,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    ).apply(up)
 
     passes = []
-    for sample, label in samples:
-        for psm in (6, 11):
-            config = f"--oem 3 --psm {psm}"
-            text = pytesseract.image_to_string(sample, config=config).strip()
-            data = pytesseract.image_to_data(sample, config=config, output_type=pytesseract.Output.DICT)
-            confs = []
-            for raw in data.get("conf", []):
-                try:
-                    value = float(raw)
-                    if value >= 0:
-                        confs.append(value)
-                except (ValueError, TypeError):
-                    pass
-            confidence = round(sum(confs) / len(confs), 2) if confs else 0.0
-            passes.append({"text": text, "confidence": confidence, "method": f"{label}_psm_{psm}"})
 
-    best = max(passes, key=lambda item: item["confidence"])
-    # Combine unique OCR lines from the best passes. This improves recovery of
-    # fields that one preprocessing variant misses without inventing values.
-    lines = []
-    seen = set()
-    for item in sorted(passes, key=lambda x: x["confidence"], reverse=True):
-        for line in item["text"].splitlines():
-            clean = line.strip()
-            key = re.sub(r"\s+", " ", clean).upper()
-            if clean and key not in seen:
-                seen.add(key)
-                lines.append(clean)
+    for sample, label, psm in [
+        (up, "full", 6),
+        (clahe, "clahe", 11),
+    ]:
+        config = f"--oem 3 --psm {psm}"
+
+        data = pytesseract.image_to_data(
+            sample,
+            config=config,
+            output_type=pytesseract.Output.DICT,
+        )
+
+        lines = []
+        confidences = []
+
+        for i, raw_conf in enumerate(data.get("conf", [])):
+            try:
+                conf = float(raw_conf)
+            except (ValueError, TypeError):
+                continue
+
+            text = str(data["text"][i]).strip()
+
+            if conf >= 25 and text:
+                lines.append(text)
+
+            if conf >= 0:
+                confidences.append(conf)
+
+        confidence = (
+            sum(confidences) / len(confidences)
+            if confidences else 0.0
+        )
+
+        passes.append({
+            "text": " ".join(lines),
+            "confidence": round(confidence, 2),
+            "method": f"{label}_psm_{psm}",
+        })
+
+    best = max(passes, key=lambda x: x["confidence"])
+
     return {
-        "text": "\n".join(lines),
+        "text": best["text"],
         "confidence": best["confidence"],
-        "method": f"ensemble_{best['method']}",
-        "passes": [{"method": x["method"], "confidence": x["confidence"]} for x in passes],
+        "method": f"fast_{best['method']}",
+        "passes": [
+            {
+                "method": p["method"],
+                "confidence": p["confidence"],
+            }
+            for p in passes
+        ],
     }
-
 
 def run_mrz_ocr(image: Image.Image) -> dict:
     """Focused OCR for the bottom machine-readable zone of a passport."""
