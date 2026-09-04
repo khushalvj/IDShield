@@ -14,9 +14,16 @@ from PIL import Image, ImageOps
 # TESSERACT
 # ---------------------------------------------------------
 
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+import os
+import shutil
+
+_tesseract = shutil.which("tesseract")
+if _tesseract:
+    pytesseract.pytesseract.tesseract_cmd = _tesseract
+elif os.name == "nt":
+    _windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(_windows_tesseract):
+        pytesseract.pytesseract.tesseract_cmd = _windows_tesseract
 
 
 # ---------------------------------------------------------
@@ -34,6 +41,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://idshield-1.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -1731,4 +1739,5 @@ async def analyze_document(
             },
         },
     }
+
 
